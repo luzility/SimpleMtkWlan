@@ -21,6 +21,7 @@
 */
 
 #include "MtkHalService.hpp"
+#include <kern/clock.h>
 
 #define super OSObject
 OSDefineMetaClassAndAbstractStructors(MtkHalService, OSObject)
@@ -72,6 +73,31 @@ tsleep_nsec(void *ident, int priority, const char *wmesg, uint64_t timo)
 //    XYLog("%s %s\n", __FUNCTION__, wmesg);
     struct timespec ts;
     int err;
+
+    // enable()/disable() and other IONetworkController commands run with
+    // the work-loop gate held, and MCU responses are delivered by the
+    // interrupt event source on that same work loop. msleep() would keep
+    // the gate closed, so every MCU command issued there timed out
+    // ("command 46ed timeout" and no scans after an interface down/up).
+    // commandSleep() releases the gate while waiting. BSD wakeup() on the
+    // same ident wakes either kind of sleeper.
+    if (this->mainCommandGate != NULL && this->mainWorkLoop != NULL &&
+        this->mainWorkLoop->inGate()) {
+        IOReturn ret;
+
+        if (timo == 0) {
+            ret = this->mainCommandGate->commandSleep(ident, THREAD_INTERRUPTIBLE);
+        } else {
+            uint64_t deadline;
+            nanoseconds_to_absolutetime(timo, &deadline);
+            deadline += mach_absolute_time();
+            ret = this->mainCommandGate->commandSleep(ident, deadline, THREAD_INTERRUPTIBLE);
+        }
+        if (ret == THREAD_AWAKENED)
+            return 0;
+        return ret == THREAD_TIMED_OUT ? EWOULDBLOCK : EINTR;
+    }
+
     memset(&ts, 0, sizeof(struct timespec));
     ts.tv_sec = timo / 1000000000ULL;
     ts.tv_nsec = timo % 1000000000ULL;

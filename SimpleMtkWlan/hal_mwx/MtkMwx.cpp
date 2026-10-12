@@ -1435,6 +1435,34 @@ mwx_bgscan_done_task(void *arg)
 	splx(s);
 }
 
+/* Free the software crypto context mwx_set_key() keeps for RX fallback. */
+static void
+mwx_sw_key_delete(struct ieee80211com *ic, struct ieee80211_key *k)
+{
+	if ((k->k_flags & IEEE80211_KEY_SWCRYPTO) == 0)
+		return;
+
+	switch (k->k_cipher) {
+	case IEEE80211_CIPHER_WEP40:
+	case IEEE80211_CIPHER_WEP104:
+		ieee80211_wep_delete_key(ic, k);
+		break;
+	case IEEE80211_CIPHER_TKIP:
+		ieee80211_tkip_delete_key(ic, k);
+		break;
+	case IEEE80211_CIPHER_CCMP:
+		ieee80211_ccmp_delete_key(ic, k);
+		break;
+	case IEEE80211_CIPHER_BIP:
+		ieee80211_bip_delete_key(ic, k);
+		break;
+	default:
+		break;
+	}
+	/* Unlike ieee80211_delete_key(), keep the key itself intact. */
+	k->k_flags &= ~IEEE80211_KEY_SWCRYPTO;
+}
+
 int
 mwx_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
     struct ieee80211_key *k)
@@ -1448,6 +1476,21 @@ mwx_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
 	if ((sc->sc_setkey_cur + 1) % nitems(sc->sc_setkey_arg) ==
 	    sc->sc_setkey_tail)
 		return ENOSPC;
+
+	/*
+	 * The key goes to the firmware asynchronously, but net80211 only
+	 * decrypts in software when IEEE80211_KEY_SWCRYPTO is set, so any
+	 * protected frame the hardware did not decrypt was dropped
+	 * ("input wep/wpa packets processing failed": associated, 4-way
+	 * handshake done, no DHCP lease). Like mac80211, keep a software
+	 * context as RX fallback. TX is always encrypted by the hardware
+	 * (mwx_tx never calls ieee80211_encrypt), so TX is unaffected.
+	 * Rebuild it each time: rekeys can reuse the same key slot.
+	 */
+	mwx_sw_key_delete(ic, k);
+	if (ieee80211_set_key(ic, ni, k) != 0)
+		MWX_DEV_LOG(sc, "software key fallback unavailable id=%d "
+		    "cipher=%d\n", k->k_id, k->k_cipher);
 
 	a = &sc->sc_setkey_arg[sc->sc_setkey_cur];
 	a->ni = ni;
@@ -1467,6 +1510,7 @@ mwx_delete_key(struct ieee80211com *ic, struct ieee80211_node *ni,
 	    DEVNAME(sc), ni, k->k_id, k->k_flags, k->k_cipher);
 
 	mt7921_mcu_sta_key_delete(sc, ni, k);
+	mwx_sw_key_delete(ic, k);
 }
 
 void
