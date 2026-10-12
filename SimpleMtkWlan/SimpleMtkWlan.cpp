@@ -299,19 +299,29 @@ void SimpleMtkWlan::associateSSID(const char *ssid, const char *pwd)
 bool SimpleMtkWlan::start(IOService *provider)
 {
     int boot_value = 0;
+    // IOLog rather than XYLog: kprintf output is easy to lose, and these
+    // early exits used to fail without leaving any trace.
+    IOLog("SimpleMtkWlan: start v%s\n", SMTW_VERSION);
     if (!super::start(provider)) {
+        IOLog("SimpleMtkWlan: super::start failed\n");
         return false;
     }
     pciNub = OSDynamicCast(IOPCIDevice, provider);
     if (!pciNub) {
+        IOLog("SimpleMtkWlan: provider is not an IOPCIDevice\n");
         return false;
     }
+    IOLog("SimpleMtkWlan: device %04x:%04x subsystem %04x:%04x rev %02x\n",
+          pciNub->configRead16(kIOPCIConfigVendorID), pciNub->configRead16(kIOPCIConfigDeviceID),
+          pciNub->configRead16(kIOPCIConfigSubSystemVendorID), pciNub->configRead16(kIOPCIConfigSubSystemID),
+          pciNub->configRead8(kIOPCIConfigRevisionID));
     pciNub->setBusMasterEnable(true);
     pciNub->setIOEnable(true);
     pciNub->setMemoryEnable(true);
     pciNub->configWrite8(0x41, 0);
     if (pciNub->requestPowerDomainState(kIOPMPowerOn,
                                         (IOPowerConnection *) getParentEntry(gIOPowerPlane), IOPMLowestState) != IOPMNoErr) {
+        IOLog("SimpleMtkWlan: requestPowerDomainState failed\n");
         return false;
     }
     if (initPCIPowerManagment(pciNub) == false) {
@@ -407,6 +417,7 @@ bool SimpleMtkWlan::start(IOService *provider)
     }
     registerService();
     fNetIf->registerService();
+    IOLog("SimpleMtkWlan: started\n");
     return true;
 }
 
