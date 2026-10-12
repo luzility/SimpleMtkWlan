@@ -455,6 +455,11 @@ struct mwx_softc {
 	struct mwx_vif		sc_vif;
 	uint32_t		sc_wcid_mask;
 	uint32_t		sc_intr_mask;
+	uint32_t		sc_intr_count;		/* handler runs with events */
+	uint32_t		sc_intr_recheck;	/* events found after re-enable */
+	uint32_t		sc_intr_kicks;		/* handler run by the watchdog */
+	uint32_t		sc_wd_ticks;
+	int			sc_intr_stall;
 
 	/* mcu */
 	uint32_t		sc_mcu_seq;
@@ -657,6 +662,7 @@ int	mwx_mcu_wait_resp_msg(struct mwx_softc *, uint32_t, int,
 	    struct mbuf **);
 
 int		mwx_dma_disable(struct mwx_softc *sc, int force);
+static void	mwx_intr_watchdog(struct mwx_softc *);
 void		mwx_dma_enable(struct mwx_softc *sc);
 int		mwx_mcu_fw_pmctrl(struct mwx_softc *);
 int		mwx_mcu_drv_pmctrl(struct mwx_softc *);
@@ -1010,6 +1016,7 @@ void
 mwx_watchdog(struct ifnet *ifp)
 {
 	ifp->if_timer = 0;
+	mwx_intr_watchdog((struct mwx_softc *)ifp->if_softc);
 	ieee80211_watchdog(ifp);
 }
 
@@ -1702,6 +1709,8 @@ mwx_intr(void *arg)
 	uint32_t mask = sc->sc_intr_mask;
 	static uint32_t intr_log_count;
 	static uint32_t intr_unhandled_log_count;
+	static uint32_t mcu_state_log_count;
+	int rounds = 0;
 
 	mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, 0);
 	intr = mwx_read(sc, MT_WFDMA0_HOST_INT_STA);
@@ -1709,6 +1718,9 @@ mwx_intr(void *arg)
 		mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, mask);
 		return 0;
 	}
+
+again:
+	sc->sc_intr_count++;
 
 	/* TODO power management */
 //	mt76_connac_pm_ref(&dev->mphy, &dev->pm);
@@ -1730,7 +1742,9 @@ mwx_intr(void *arg)
 
 	if (intr & MT_INT_MCU_CMD) {
 		intr_sw = mwx_read(sc, MT_MCU_CMD);
-		if (intr_log_count < 16)
+		if (intr_log_count < 16 ||
+		    ((intr_sw & MT_MCU_CMD_ERROR_MASK) &&
+		    mcu_state_log_count++ < 32))
 			MWX_DEV_LOG(sc, "mcu interrupt status=0x%08x\n", intr_sw);
 		/* ack MCU2HOST_SW_INT_STA */
 		mwx_write(sc, MT_MCU_CMD, intr_sw);
@@ -1753,7 +1767,84 @@ mwx_intr(void *arg)
 
 	mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, mask);
 
+	/*
+	 * MSI is a message, not a level. Events latched while INT_ENA was
+	 * cleared above must not depend on the device raising a new message
+	 * when it is set again, so look once more before returning.
+	 */
+	intr = mwx_read(sc, MT_WFDMA0_HOST_INT_STA);
+	if ((intr & mask) != 0 && ++rounds < 32) {
+		sc->sc_intr_recheck++;
+		mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, 0);
+		goto again;
+	}
+
 	return 1;
+}
+
+/*
+ * Interrupt health check, once a second from the watchdog.
+ *
+ * On the MT7922 test system every interrupt source went quiet a few
+ * frames after association: no RX, no MCU responses, no scan-done. DHCP
+ * never completed and every later MCU command timed out, including the
+ * ones issued on interface down/up. Log the WFDMA/MCU state so a run
+ * shows whether events sit in INT_STA without an interrupt arriving or
+ * the device stopped producing them, and if events stay latched for a
+ * full period, run the handler on the work loop ourselves.
+ */
+static void
+mwx_intr_kick(void *arg)
+{
+	(void)mwx_intr(arg);
+}
+
+static void
+mwx_intr_watchdog(struct mwx_softc *sc)
+{
+	static uint32_t health_log_count, mcu_err_log_count, kick_log_count;
+	uint32_t sta, ena, mcu, pending;
+
+	sta = mwx_read(sc, MT_WFDMA0_HOST_INT_STA);
+	ena = mwx_read(sc, MT_WFDMA0_HOST_INT_ENA);
+	mcu = mwx_read(sc, MT_MCU_CMD);
+	pending = sta & sc->sc_intr_mask;
+
+	if ((++sc->sc_wd_ticks % 10) == 1 && health_log_count < 60) {
+		health_log_count++;
+		MWX_DEV_LOG(sc, "health t=%us intr=%u recheck=%u kicks=%u "
+		    "sta=0x%08x ena=0x%08x mcu=0x%08x "
+		    "rxq cpu=%u dma=%u cons=%u rxmcu cpu=%u dma=%u cons=%u\n",
+		    sc->sc_wd_ticks, sc->sc_intr_count, sc->sc_intr_recheck,
+		    sc->sc_intr_kicks, sta, ena, mcu,
+		    mwx_read(sc, sc->sc_rxq.mq_regbase + MT_DMA_CPU_IDX),
+		    mwx_read(sc, sc->sc_rxq.mq_regbase + MT_DMA_DMA_IDX),
+		    sc->sc_rxq.mq_cons,
+		    mwx_read(sc, sc->sc_rxmcuq.mq_regbase + MT_DMA_CPU_IDX),
+		    mwx_read(sc, sc->sc_rxmcuq.mq_regbase + MT_DMA_DMA_IDX),
+		    sc->sc_rxmcuq.mq_cons);
+	}
+	if ((mcu & MT_MCU_CMD_ERROR_MASK) && mcu_err_log_count < 16) {
+		mcu_err_log_count++;
+		MWX_DEV_LOG(sc, "MCU error state mcu=0x%08x sta=0x%08x\n",
+		    mcu, sta);
+	}
+
+	if (pending == 0) {
+		sc->sc_intr_stall = 0;
+		return;
+	}
+	if (++sc->sc_intr_stall < 2)
+		return;
+	sc->sc_intr_stall = 0;
+	sc->sc_intr_kicks++;
+	if (kick_log_count < 32) {
+		kick_log_count++;
+		MWX_DEV_LOG(sc, "interrupt stalled sta=0x%08x ena=0x%08x "
+		    "intr=%u, running handler\n", sta, ena, sc->sc_intr_count);
+	}
+	if (gMwxHal != NULL && !gMwxHal->mwxTryRunGated(mwx_intr_kick, sc))
+		sc->sc_intr_stall = 1;	/* gate busy: retry next tick */
 }
 
 int
@@ -6736,6 +6827,29 @@ void
 MtkMwx::mwxWakeup(void *ident)
 {
 	wakeupOn(ident);
+}
+
+static IOReturn
+mwxGatedCall(OSObject *owner, void *fn, void *arg, void *, void *)
+{
+	((void (*)(void *))fn)(arg);
+	return kIOReturnSuccess;
+}
+
+/*
+ * Run fn(arg) on the main work loop, serialized with the interrupt source.
+ * Never blocks: callers on other work loops (the watchdog) must not wait
+ * for a gate whose holder may in turn wait for them.
+ */
+bool
+MtkMwx::mwxTryRunGated(void (*fn)(void *), void *arg)
+{
+	IOCommandGate *gate = getMainCommandGate();
+
+	if (gate == NULL)
+		return false;
+	return gate->attemptAction(mwxGatedCall, (void *)fn, arg) ==
+	    kIOReturnSuccess;
 }
 
 const char *
