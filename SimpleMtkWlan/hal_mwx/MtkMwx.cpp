@@ -340,6 +340,13 @@ struct mwx_queue {
 	bus_dmamap_t			mq_map;
 	bus_dma_segment_t		mq_seg;
 	int				mq_wakeme;
+	/*
+	 * MCU commands and firmware download are submitted from the attach /
+	 * caller thread, outside the work loop, while TX completion runs from
+	 * the interrupt event source on the work loop. Both walk mq_prod,
+	 * mq_cons and md_mbuf, so ring updates are serialized here.
+	 */
+	IOLock				*mq_lock;
 };
 
 struct mwx_hw_capa {
@@ -2265,6 +2272,12 @@ mwx_queue_alloc(struct mwx_softc *sc, struct mwx_queue *q, int count,
 	q->mq_regbase = regbase;
 	q->mq_count = count;
 
+	q->mq_lock = IOLockAlloc();
+	if (q->mq_lock == NULL) {
+		error = ENOMEM;
+		goto fail;
+	}
+
 	error = bus_dmamap_create(sc->sc_dmat, size, 1, size, 0,
 	    BUS_DMA_NOWAIT, &q->mq_map);
 	if (error != 0) {
@@ -2353,11 +2366,14 @@ mwx_queue_free(struct mwx_softc *sc, struct mwx_queue *q)
 	if (q->mq_map != NULL)
 		bus_dmamem_free(sc->sc_dmat, &q->mq_seg, 1);
 
+	if (q->mq_lock != NULL)
+		IOLockFree(q->mq_lock);
+
 	memset(q, 0, sizeof(*q));
 }
 
-void
-mwx_queue_reset(struct mwx_softc *sc, struct mwx_queue *q)
+static void
+mwx_queue_reset_locked(struct mwx_softc *sc, struct mwx_queue *q)
 {
 	int i;
 	uint32_t dmaaddr;
@@ -2400,6 +2416,16 @@ mwx_queue_reset(struct mwx_softc *sc, struct mwx_queue *q)
 			md->md_mbuf = NULL;
 		}
 	}
+}
+
+void
+mwx_queue_reset(struct mwx_softc *sc, struct mwx_queue *q)
+{
+	if (q->mq_lock == NULL)		/* queue not allocated */
+		return;
+	IOLockLock(q->mq_lock);
+	mwx_queue_reset_locked(sc, q);
+	IOLockUnlock(q->mq_lock);
 }
 
 int
@@ -2575,8 +2601,9 @@ mwx_dma_free_slots(struct mwx_queue *q)
 	return free;
 }
 
-int
-mwx_dma_tx_enqueue(struct mwx_softc *sc, struct mwx_queue *q, struct mbuf *m)
+static int
+mwx_dma_tx_enqueue_locked(struct mwx_softc *sc, struct mwx_queue *q,
+    struct mbuf *m)
 {
 	struct mwx_queue_data *md;
 	struct mwx_desc *desc;
@@ -2652,7 +2679,20 @@ mwx_dma_tx_enqueue(struct mwx_softc *sc, struct mwx_queue *q, struct mbuf *m)
 }
 
 int
-mwx_dma_txwi_enqueue(struct mwx_softc *sc, struct mwx_queue *q,
+mwx_dma_tx_enqueue(struct mwx_softc *sc, struct mwx_queue *q, struct mbuf *m)
+{
+	int rv;
+
+	if (q->mq_lock == NULL)
+		return ENXIO;
+	IOLockLock(q->mq_lock);
+	rv = mwx_dma_tx_enqueue_locked(sc, q, m);
+	IOLockUnlock(q->mq_lock);
+	return rv;
+}
+
+static int
+mwx_dma_txwi_enqueue_locked(struct mwx_softc *sc, struct mwx_queue *q,
     struct mwx_txwi *mt)
 {
 	struct mwx_queue_data *md;
@@ -2706,8 +2746,22 @@ mwx_dma_txwi_enqueue(struct mwx_softc *sc, struct mwx_queue *q,
 	return 0;
 }
 
-void
-mwx_dma_tx_cleanup(struct mwx_softc *sc, struct mwx_queue *q)
+int
+mwx_dma_txwi_enqueue(struct mwx_softc *sc, struct mwx_queue *q,
+    struct mwx_txwi *mt)
+{
+	int rv;
+
+	if (q->mq_lock == NULL)
+		return ENXIO;
+	IOLockLock(q->mq_lock);
+	rv = mwx_dma_txwi_enqueue_locked(sc, q, mt);
+	IOLockUnlock(q->mq_lock);
+	return rv;
+}
+
+static void
+mwx_dma_tx_cleanup_locked(struct mwx_softc *sc, struct mwx_queue *q)
 {
 	struct mwx_queue_data *md;
 	struct mwx_desc *desc;
@@ -2766,6 +2820,17 @@ mwx_dma_tx_cleanup(struct mwx_softc *sc, struct mwx_queue *q)
 		q->mq_wakeme = 0;
 		wakeup(q);
 	}
+}
+
+void
+mwx_dma_tx_cleanup(struct mwx_softc *sc, struct mwx_queue *q)
+{
+	/* The interrupt is established before the rings are allocated. */
+	if (q->mq_lock == NULL)
+		return;
+	IOLockLock(q->mq_lock);
+	mwx_dma_tx_cleanup_locked(sc, q);
+	IOLockUnlock(q->mq_lock);
 }
 
 void
