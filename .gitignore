@@ -15,3 +15,6 @@ build/
 *.kext/
 *.zip
 *.tar.gz
+
+# Fetched by CI / developer
+MacKernelSDK/

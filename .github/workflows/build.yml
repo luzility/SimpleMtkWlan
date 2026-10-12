@@ -1,0 +1,97 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Pinned for reproducible builds; bump deliberately.
+  MACKERNELSDK_REF: 3f750085caa17ec3a7880f11c11bf4f48cd6a164
+
+jobs:
+  host-tests:
+    name: Host tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run host tests (ASan/UBSan)
+        run: sh tests/run-all.sh
+
+  kext:
+    name: Kext (${{ matrix.configuration }})
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch MacKernelSDK
+        run: |
+          git init -q MacKernelSDK
+          git -C MacKernelSDK fetch -q --depth 1 https://github.com/acidanthera/MacKernelSDK.git "$MACKERNELSDK_REF"
+          git -C MacKernelSDK checkout -q FETCH_HEAD
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+
+      - name: Build
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project SimpleMtkWlan.xcodeproj \
+            -scheme SimpleMtkWlan \
+            -configuration "${{ matrix.configuration }}" \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | tee build.log
+
+      - name: Package
+        id: package
+        run: |
+          products="build/Build/Products/${{ matrix.configuration }}"
+          ver=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$products/SimpleMtkWlan.kext/Contents/Info.plist")
+          name="SimpleMtkWlan-${ver}-${GITHUB_SHA::7}-${{ matrix.configuration }}"
+          files="SimpleMtkWlan.kext"
+          [ -d "$products/SimpleMtkWlan.kext.dSYM" ] && files="$files SimpleMtkWlan.kext.dSYM"
+          mkdir -p dist
+          (cd "$products" && zip -qry "$GITHUB_WORKSPACE/dist/$name.zip" $files)
+          file "$products/SimpleMtkWlan.kext/Contents/MacOS/SimpleMtkWlan"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: build-log-${{ matrix.configuration }}
+          path: build.log
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [host-tests, kext]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          pattern: SimpleMtkWlan-*
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.zip --repo "$GITHUB_REPOSITORY" --prerelease --generate-notes
