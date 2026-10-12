@@ -254,6 +254,14 @@ static const struct pci_matchid mwx_devices[] = {
  * The PCIe interrupt and MCU paths can otherwise flood the kernel log. */
 /* #define MWX_DEBUG	1 */
 
+/* FW_SCATTER is a plain byte stream, so the chunk size is ours to pick (Linux
+ * uses 2048 on SDIO). mwx_mcu_alloc_msg() reserves MCU TXD headroom on top of
+ * the payload; 4096-byte chunks therefore need 4160-byte single-cluster mbufs,
+ * i.e. 16 KB jumbo clusters, which M_DONTWAIT cannot get early in boot
+ * (seen as "patch send failed ... error=12"). Keep each message in a 4 KB
+ * cluster instead. */
+#define	MWX_FW_CHUNK_LEN	(4096 - sizeof(struct mwx_mcu_txd))
+
 #define	MT7921_ROM_PATCH	"mwx-mt7961_patch_mcu_1_2_hdr"
 #define	MT7921_FIRMWARE_WM	"mwx-mt7961_ram_code_1"
 #define	MT7922_ROM_PATCH	"mwx-mt7922_patch_mcu_1_1_hdr"
@@ -3774,7 +3782,7 @@ mwx_load_firmware(struct mwx_softc *sc)
 			goto out;
 		}
 		rv = mwx_mcu_send_firmware(sc, MCU_CMD_FW_SCATTER,
-		    dl, len, 4096);
+		    dl, len, MWX_FW_CHUNK_LEN);
 		if (rv != 0) {
 			MWX_DEV_LOG(sc, "patch send failed index=%d error=%d\n",
 			    i, rv);
@@ -3853,7 +3861,7 @@ out:
 		}
 
 		rv = mwx_mcu_send_firmware(sc, MCU_CMD_FW_SCATTER,
-		    fwbuf + offset, len, 4096);
+		    fwbuf + offset, len, MWX_FW_CHUNK_LEN);
 		if (rv != 0) {
 			MWX_DEV_LOG(sc, "WM send failed index=%d error=%d\n",
 			    i, rv);
@@ -4043,8 +4051,12 @@ mwx_mcu_send_firmware(struct mwx_softc *sc, int cmd, u_char *data,
 			cur_len = max_len;
 
 		rv = mwx_mcu_send_msg(sc, cmd, data, cur_len, NULL);
-		if (rv != 0)
+		if (rv != 0) {
+			MWX_DEV_LOG(sc, "firmware chunk send failed cmd=0x%08x "
+			    "chunk=%zu remaining=%zu error=%d\n",
+			    (uint32_t)cmd, cur_len, len, rv);
 			return rv;
+		}
 
 		data += cur_len;
 		len -= cur_len;
