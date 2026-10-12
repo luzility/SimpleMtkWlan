@@ -35,6 +35,55 @@
 OSDefineMetaClassAndStructors(SimpleMtkWlan, IOEthernetController)
 OSDefineMetaClassAndStructors(CTimeout, OSObject)
 
+// Driver log ring. On real systems early-boot kernel messages are easily lost
+// (dmesg is small, and os_log cannot decode an injected kext), so the last
+// kMtkLogSize bytes are also published on the PCI nub as "SimpleMtkWlan-log".
+// It lives on the provider so it survives a failed probe or start.
+#define kMtkLogSize (64 * 1024)
+static char gMtkLog[kMtkLogSize];
+static volatile SInt64 gMtkLogCursor;   // total bytes ever written
+static SInt64 gMtkLogPublished = -1;
+
+extern "C" void mtk_log(const char *fmt, ...)
+{
+    char line[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (n <= 0)
+        return;
+    if (n >= (int)sizeof(line))
+        n = sizeof(line) - 1;
+    (printf)("%s", line);
+    // Writers reserve disjoint ranges; a reader may see a line half written.
+    SInt64 pos = OSAddAtomic64(n, &gMtkLogCursor);
+    for (int i = 0; i < n; i++)
+        gMtkLog[(pos + i) % kMtkLogSize] = line[i];
+}
+
+static void mtkLogPublish(IOService *target)
+{
+    SInt64 end = gMtkLogCursor;
+    if (target == NULL || end == gMtkLogPublished)
+        return;
+    SInt64 begin = end > kMtkLogSize ? end - kMtkLogSize : 0;
+    size_t len = (size_t)(end - begin);
+    char *copy = (char *)IOMalloc(len + 1);
+    if (copy == NULL)
+        return;
+    for (size_t i = 0; i < len; i++)
+        copy[i] = gMtkLog[(begin + i) % kMtkLogSize];
+    copy[len] = '\0';
+    OSString *text = OSString::withCString(copy);
+    IOFree(copy, len + 1);
+    if (text != NULL) {
+        target->setProperty("SimpleMtkWlan-log", text);
+        text->release();
+        gMtkLogPublished = end;
+    }
+}
+
 IOWorkLoop *_fWorkloop;
 IOCommandGate *_fCommandGate;
 
@@ -73,6 +122,14 @@ static void pciMsiXClearAndSet(IOPCIDevice *device, UInt8 msixCap, UInt16 clear,
 
 IOService* SimpleMtkWlan::probe(IOService *provider, SInt32 *score)
 {
+    IOService *result = probeDriver(provider, score);
+    XYLog("probe %s\n", result ? "matched" : "rejected");
+    mtkLogPublish(provider);
+    return result;
+}
+
+IOService* SimpleMtkWlan::probeDriver(IOService *provider, SInt32 *score)
+{
     bool isMatch = false;
     super::probe(provider, score);
     UInt8 msiCap;
@@ -94,6 +151,7 @@ IOService* SimpleMtkWlan::probe(IOService *provider, SInt32 *score)
         if (msiCap) {
             pciMsiSetEnable(device, msiCap, 1);
         }
+        XYLog("probe: MSI cap 0x%02x, MSI-X cap 0x%02x\n", msiCap, msixCap);
         if (!msiCap && !msixCap) {
             XYLog("%s No MSI cap\n", __FUNCTION__);
             fHalService->release();
@@ -298,20 +356,26 @@ void SimpleMtkWlan::associateSSID(const char *ssid, const char *pwd)
 
 bool SimpleMtkWlan::start(IOService *provider)
 {
+    bool ok = startDriver(provider);
+    XYLog("start %s\n", ok ? "succeeded" : "failed");
+    mtkLogPublish(provider);
+    return ok;
+}
+
+bool SimpleMtkWlan::startDriver(IOService *provider)
+{
     int boot_value = 0;
-    // IOLog rather than XYLog: kprintf output is easy to lose, and these
-    // early exits used to fail without leaving any trace.
-    IOLog("SimpleMtkWlan: start v%s\n", SMTW_VERSION);
+    XYLog("start v%s\n", SMTW_VERSION);
     if (!super::start(provider)) {
-        IOLog("SimpleMtkWlan: super::start failed\n");
+        XYLog("super::start failed\n");
         return false;
     }
     pciNub = OSDynamicCast(IOPCIDevice, provider);
     if (!pciNub) {
-        IOLog("SimpleMtkWlan: provider is not an IOPCIDevice\n");
+        XYLog("provider is not an IOPCIDevice\n");
         return false;
     }
-    IOLog("SimpleMtkWlan: device %04x:%04x subsystem %04x:%04x rev %02x\n",
+    XYLog("device %04x:%04x subsystem %04x:%04x rev %02x\n",
           pciNub->configRead16(kIOPCIConfigVendorID), pciNub->configRead16(kIOPCIConfigDeviceID),
           pciNub->configRead16(kIOPCIConfigSubSystemVendorID), pciNub->configRead16(kIOPCIConfigSubSystemID),
           pciNub->configRead8(kIOPCIConfigRevisionID));
@@ -321,7 +385,7 @@ bool SimpleMtkWlan::start(IOService *provider)
     pciNub->configWrite8(0x41, 0);
     if (pciNub->requestPowerDomainState(kIOPMPowerOn,
                                         (IOPowerConnection *) getParentEntry(gIOPowerPlane), IOPMLowestState) != IOPMNoErr) {
-        IOLog("SimpleMtkWlan: requestPowerDomainState failed\n");
+        XYLog("requestPowerDomainState failed\n");
         return false;
     }
     if (initPCIPowerManagment(pciNub) == false) {
@@ -417,7 +481,6 @@ bool SimpleMtkWlan::start(IOService *provider)
     }
     registerService();
     fNetIf->registerService();
-    IOLog("SimpleMtkWlan: started\n");
     return true;
 }
 
@@ -425,6 +488,7 @@ void SimpleMtkWlan::watchdogAction(IOTimerEventSource *timer)
 {
     struct _ifnet *ifp = getIfp();
     (*ifp->if_watchdog)(ifp);
+    mtkLogPublish(pciNub);
     watchdogTimer->setTimeoutMS(kWatchDogTimerPeriod);
 }
 

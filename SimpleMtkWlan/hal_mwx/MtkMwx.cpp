@@ -57,6 +57,10 @@ OSDefineMetaClassAndStructors(MtkMwx, MtkHalService)
 #define PCI_PRODUCT_MEDIATEK_MT7921K   0x0608
 #define PCI_PRODUCT_MEDIATEK_MT7922    0x7922
 
+/* Route the OpenBSD driver's printf (attach/MCU/firmware errors) into the
+ * driver log ring too, so it can be read back from the IORegistry. */
+#define printf(...) mtk_log(__VA_ARGS__)
+
 #define MWX_LOG(x...) printf("SimpleMtkWlan-mwx: " x)
 #define MWX_DEV_LOG(sc, fmt, args...) \
 	printf("SimpleMtkWlan-mwx: %s: " fmt, DEVNAME(sc), ##args)
