@@ -22,6 +22,7 @@
 
 #include "MtkWlanUserClient.hpp"
 #include <sys/_netstat.h>
+#include <kern/clock.h>
 
 #define super IOUserClient
 OSDefineMetaClassAndStructors( MtkWlanUserClient, IOUserClient );
@@ -367,6 +368,23 @@ IOReturn MtkWlanUserClient::
 sSCAN(OSObject* target, void* data, bool isSet)
 {
     MtkWlanUserClient *that = OSDynamicCast(MtkWlanUserClient, target);
+    struct ieee80211com *ic = (struct ieee80211com *)that->fIfp;
+    static uint64_t lastRunScan;
+    uint64_t now, ns = 0;
+
+    /*
+     * SimpleMTK asks for a scan every 5 s while its menu is open. Each
+     * one is a full background scan off the BSS channel, so while
+     * associated serve at most one per 30 s; requests in between get the
+     * cached results via SCAN_RESULT.
+     */
+    if (ic->ic_state == IEEE80211_S_RUN) {
+        now = mach_absolute_time();
+        absolutetime_to_nanoseconds(now - lastRunScan, &ns);
+        if (lastRunScan != 0 && ns < 30ULL * 1000000000ULL)
+            return kIOReturnSuccess;
+        lastRunScan = now;
+    }
     ieee80211_begin_cache_bgscan(that->fIfp);
     return kIOReturnSuccess;
 }

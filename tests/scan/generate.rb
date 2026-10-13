@@ -64,8 +64,10 @@ int main(){
   check(captured.seq_num==0,"sequence wrap");
   check(captured.channels_num==std::min(n,32u),"primary channel count");
   check(captured.ext_channels_num==(n>32?std::min(n,64u)-32:0),"extra channel count");
-  check(captured.timeout_value==std::min(n,64u)*120,"timeout");
-  check(captured.channel_dwell_time==120 && captured.channel_min_dwell_time==120,"dwell");
+  /* background scans use the firmware default channel time (0), as mt76 does for connac2 */
+  unsigned dwell=bg?0:120;
+  check(captured.timeout_value==std::min(n,64u)*dwell,"timeout");
+  check(captured.channel_dwell_time==dwell && captured.channel_min_dwell_time==dwell,"dwell");
   check(captured.channel_type==(n?4:0),"channel type");
   check(captured.ssid_type==1 && captured.ssid_type_ext==0 && captured.ssids_num==0,"SSID mode");
   check(captured.version==1 && captured.scan_type==0 && captured.probe_req_num==0,"scan mode");
