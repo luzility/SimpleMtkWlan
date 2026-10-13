@@ -1288,10 +1288,17 @@ ieee80211_add_hecaps(uint8_t *frm, struct ieee80211com *ic)
     memcpy(frm, &ic->ic_he_mcs_nss_supp, nss_size);
     frm += nss_size;
     
-    /* Check if PPE Threshold should be present */
+    /*
+     * Check if PPE Threshold should be present. The element length is
+     * filled in at the end; returning early here used to leave it as
+     * whatever the mbuf held, so APs got a malformed HE capabilities
+     * element and associated without HE (it only worked by chance).
+     */
     if ((ic->ic_he_cap_elem.phy_cap_info[6] &
-         IEEE80211_HE_PHY_CAP6_PPE_THRESHOLD_PRESENT) == 0)
+         IEEE80211_HE_PHY_CAP6_PPE_THRESHOLD_PRESENT) == 0) {
+        orig_pos[1] = (frm - orig_pos) - 2;
         return frm;
+    }
     
     /*
      * Calculate how many PPET16/PPET8 pairs are to come. Algorithm:
