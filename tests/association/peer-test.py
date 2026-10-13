@@ -24,6 +24,10 @@ struct mbuf{unsigned char bytes[256];size_t len;};
 mbuf storage;bool alloc_fail=false,header_fail=false;int send_rc=0,wait_rc=0,sends=0,waits=0;uint32_t fw=0;
 mbuf*mwx_alloc_sta_req_tlv(size_t){memset(&storage,0xbd,sizeof(storage));storage.len=0;return alloc_fail?nullptr:&storage;}
 void mt7921_mcu_add_basic_tlv(mbuf*m,uint16_t*n,mwx_softc*,ieee80211_node*ni,int add,int isnew){assert(add==1&&isnew==0);assert(IEEE80211_AID(ni->ni_associd)==37);m->len=32;(*n)++;}
+int rate_calls=0;
+/* HT/VHT/PHY/RA records are covered by their own builder; here only that the peer update asks for them. */
+void mwx_append_sta_rate_tlvs(mbuf*m,uint16_t*,mwx_softc*,ieee80211_node*ni){assert(m->len==32);assert(IEEE80211_AID(ni->ni_associd)==37);rate_calls++;}
+uint8_t mwx_node_vht_opmode(ieee80211_node*){return 0;}
 void*mwx_append_tlv(mbuf*m,uint16_t*n,int tag,int len){auto*p=m->bytes+m->len;memset(p,0,len);((uint16_t*)p)[0]=tag;((uint16_t*)p)[1]=len;m->len+=len;(*n)++;return p;}
 mbuf*mwx_fill_sta_req_hdr(mbuf*m,mwx_vif*,uint8_t omac,uint16_t wcid,uint16_t n){assert(omac==3&&wcid==287&&n==2);return header_fail?nullptr:m;}
 int mwx_mcu_send_mbuf(mwx_softc*,int cmd,mbuf*m,int*seq){assert(cmd==MCU_UNI_CMD_STA_REC_UPDATE);assert(m->len==44);unsigned char golden[]={0x07,0,12,0,0,0,0,0,2,0,0,0};assert(!memcmp(m->bytes+32,golden,12));*seq=9;sends++;return send_rc;}
@@ -31,7 +35,7 @@ int mwx_mcu_wait_resp_int(mwx_softc*,int cmd,int seq,uint32_t*status){assert(cmd
 '''
 post=r'''
 int main(){mwx_node n{{uint16_t(0xc000|37)},287};mwx_softc sc{{&n.ni},{3}};
- assert(mt7921_mcu_set_associated_peer(&sc)==0);assert(sends==1&&waits==1);
+ assert(mt7921_mcu_set_associated_peer(&sc)==0);assert(sends==1&&waits==1&&rate_calls==1);
  fw=7;assert(mt7921_mcu_set_associated_peer(&sc)==EIO);fw=0;
  wait_rc=ETIMEDOUT;assert(mt7921_mcu_set_associated_peer(&sc)==ETIMEDOUT);wait_rc=0;
  int before=waits;send_rc=ENOBUFS;assert(mt7921_mcu_set_associated_peer(&sc)==ENOBUFS&&waits==before);send_rc=0;
@@ -39,7 +43,7 @@ int main(){mwx_node n{{uint16_t(0xc000|37)},287};mwx_softc sc{{&n.ni},{3}};
  header_fail=true;assert(mt7921_mcu_set_associated_peer(&sc)==ENOBUFS&&sends==before);header_fail=false;
  n.ni.ni_associd=0;assert(mt7921_mcu_set_associated_peer(&sc)==EINVAL&&sends==before);
  sc.sc_ic.ic_bss=nullptr;assert(mt7921_mcu_set_associated_peer(&sc)==EINVAL&&sends==before);
- puts("PASS actual associated-peer builder: golden STATE TLV, AID/WCID, no WTBL reset, transport/firmware failures and absent association guards.");}
+ puts("PASS actual associated-peer builder: rate records requested, golden STATE TLV, AID/WCID, no WTBL reset, transport/firmware failures and absent association guards.");}
 '''
 p=b/'tests/association/peer-test.cpp';p.write_text(pre+state+'\n'+fn+'\n'+post)
 subprocess.run(['clang++','-std=c++14','-fsanitize=address,undefined',str(p),'-o',str(p.with_suffix(''))],check=True)
