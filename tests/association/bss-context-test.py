@@ -35,6 +35,7 @@ code=r'''
 #define CMD_CBW_160MHZ 3
 #define IEEE80211_NODE_HT 0x1
 #define IEEE80211_NODE_VHT 0x2
+#define IEEE80211_NODE_HE 0x4
 enum { IEEE80211_CHAN_WIDTH_20_NOHT, IEEE80211_CHAN_WIDTH_20, IEEE80211_CHAN_WIDTH_40, IEEE80211_CHAN_WIDTH_80, IEEE80211_CHAN_WIDTH_80P80, IEEE80211_CHAN_WIDTH_160 };
 #define MWX_DEV_LOG(...) ((void)0)
 #define htole16(x) (x)
@@ -49,6 +50,9 @@ int mt7921_mcu_chan_bw(ieee80211_channel *c){return c->width;}
 std::vector<std::vector<uint8_t>> sent;
 int fail_at=0;
 int mwx_send_assoc_status(mwx_softc*,int cmd,void *p,int n){assert(cmd==0x20002);auto b=(uint8_t*)p;sent.emplace_back(b,b+n);return int(sent.size())==fail_at?EIO:0;}
+/* HE BSS records have their own builder; here: sent only for HE nodes, between BASIC and RLM. */
+int he_calls=0,he_rc=0;
+int mwx_send_bss_he(mwx_softc*,ieee80211_node*ni){assert(ni->ni_flags&IEEE80211_NODE_HE);assert(sent.size()==1);he_calls++;return he_rc;}
 '''+struct+'\n'+chandef+'\n'+fn+r'''
 int main(){
  ieee80211_channel c{5745,0};ieee80211_node n{&c,{0xe8,0x45,0x8b,0x39,0xe0,0xa7},100,3};
@@ -74,14 +78,21 @@ int main(){
           W{5180,5190,IEEE80211_CHAN_WIDTH_40,1,0x11,38,CMD_CBW_40MHZ,4,1},   /* HT40 above (SCA) */
           W{5200,5190,IEEE80211_CHAN_WIDTH_40,1,0x11,38,CMD_CBW_40MHZ,4,3},   /* HT40 below (SCB) */
           W{5180,5190,IEEE80211_CHAN_WIDTH_20,1,0x11,36,CMD_CBW_20MHZ,0,0},   /* HT20 ignores center_freq1 */
-          W{2437,2447,IEEE80211_CHAN_WIDTH_40,1,0x0e,8,CMD_CBW_40MHZ,4,1}}){ /* 2.4 GHz HT40 */
+          W{2437,2447,IEEE80211_CHAN_WIDTH_40,1,0x0e,8,CMD_CBW_40MHZ,4,1},   /* 2.4 GHz HT40 */
+          W{5745,5775,IEEE80211_CHAN_WIDTH_80,7,0xb1,155,CMD_CBW_80MHZ,4,1},  /* HE 5 GHz: AX_5G */
+          W{2437,2447,IEEE80211_CHAN_WIDTH_40,5,0x4e,8,CMD_CBW_40MHZ,4,1}}){ /* HE 2.4 GHz: AX_24G */
   c.ic_freq=w.freq;c.ic_center_freq1=w.cf1;n.ni_chw=w.chw;n.ni_flags=w.flags;sent.clear();fail_at=0;
+  int he_before=he_calls;
   assert(mt7921_mcu_set_associated_bss(&sc,1)==0);assert(sent.size()==2);
+  assert(he_calls-he_before==((w.flags&IEEE80211_NODE_HE)?1:0));
   assert(sent[0][29]==w.phy);
   uint8_t ch=(uint8_t)ieee80211_mhz2ieee(w.freq,0),band=w.freq<3000?0:1;
   std::vector<uint8_t> rlm={3,0,0,0,2,0,16,0,ch,w.center,0,w.bw,2,3,1,w.htop,w.sco,band,0,0};
   assert(sent[1]==rlm);
  }
+ /* HE record failure stops before RLM. */
+ n.ni_flags=7;n.ni_chw=IEEE80211_CHAN_WIDTH_80;c.ic_freq=5745;c.ic_center_freq1=5775;he_rc=EIO;sent.clear();
+ assert(mt7921_mcu_set_associated_bss(&sc,1)==EIO);assert(sent.size()==1);he_rc=0;
  n.ni_flags=0;n.ni_chw=0;c.ic_center_freq1=0;c.ic_freq=5745;
  sc.sc_ic.ic_opmode=2;sent.clear();assert(mt7921_mcu_set_associated_bss(&sc,1)==0);assert(sent.empty());
  puts("PASS: real BSS constructor, golden wire packets on 7 legacy channels, VHT80/HT40 SCA/SCB/HT20/2.4 GHz HT40 RLM and phymode, disassociation, firmware failures, null guards");
