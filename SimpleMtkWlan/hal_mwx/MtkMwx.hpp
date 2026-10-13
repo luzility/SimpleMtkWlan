@@ -54,6 +54,7 @@ public:
     IOEthernetController *mwxController();
     int mwxSleepNsec(void *ident, int priority, const char *wmesg, uint64_t timo);
     void mwxWakeup(void *ident);
+    void mwxRunGated(void (*fn)(void *), void *arg);
     bool mwxTryRunGated(void (*fn)(void *), void *arg);
 
 private:

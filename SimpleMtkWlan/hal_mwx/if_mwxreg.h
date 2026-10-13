@@ -1327,6 +1327,41 @@ struct sta_rec_ra_info {
 #define	RA_LEGACY_OFDM	0x3fc0
 #define	RA_LEGACY_CCK	0x000f
 
+#define	STA_REC_BA			0x06
+struct sta_rec_ba {
+	uint16_t	tag;
+	uint16_t	len;
+	uint8_t		tid;
+	uint8_t		ba_type;
+	uint8_t		amsdu;
+	uint8_t		ba_en;		/* bitmap, 1 << tid */
+	uint16_t	ssn;
+	uint16_t	winsize;
+} __packed;
+#define	MT_BA_TYPE_INVALID		0
+#define	MT_BA_TYPE_ORIGINATOR		1
+#define	MT_BA_TYPE_RECIPIENT		2
+
+#define	STA_REC_HT			0x09
+struct sta_rec_ht {
+	uint16_t	tag;
+	uint16_t	len;
+	uint16_t	ht_cap;
+	uint16_t	rsv;
+} __packed;
+
+#define	STA_REC_VHT			0x0a
+struct sta_rec_vht {
+	uint16_t	tag;
+	uint16_t	len;
+	uint32_t	vht_cap;
+	uint16_t	vht_rx_mcs_map;
+	uint16_t	vht_tx_mcs_map;
+	/* mt7915 - mt7921 */
+	uint8_t		rts_bw_sig;
+	uint8_t		rsv[3];
+} __packed;
+
 #define	STA_REC_STATE			0x07
 struct sta_rec_state {
 	uint16_t	tag;
@@ -1443,6 +1478,30 @@ struct wtbl_hdr_trans {
 	uint8_t		no_rx_trans;
 	uint8_t		rsv;
 } __packed;
+
+#define	WTBL_BA				0x08
+struct wtbl_ba {
+	uint16_t	tag;
+	uint16_t	len;
+	/* common */
+	uint8_t		tid;
+	uint8_t		ba_type;
+	uint8_t		rsv0[2];
+	/* originator only */
+	uint16_t	sn;
+	uint8_t		ba_en;
+	uint8_t		ba_winsize_idx;
+	/* originator & recipient */
+	uint16_t	ba_winsize;
+	/* recipient only */
+	uint8_t		peer_addr[ETHER_ADDR_LEN];
+	uint8_t		rst_ba_tid;
+	uint8_t		rst_ba_sel;
+	uint8_t		rst_ba_sb;
+	uint8_t		band_idx;
+	uint8_t		rsv1[4];
+} __packed;
+#define	RST_BA_MAC_TID_MATCH		0
 
 #define	WTBL_SMPS			0x0d
 struct wtbl_smps {
