@@ -45,6 +45,7 @@
 #include <FwData.h>
 
 #include "if_mwxreg.h"
+#include <kern/clock.h>
 
 OSDefineMetaClassAndStructors(MtkMwx, MtkHalService)
 
@@ -62,6 +63,23 @@ OSDefineMetaClassAndStructors(MtkMwx, MtkHalService)
 #define printf(...) mtk_log(__VA_ARGS__)
 
 #define MWX_LOG(x...) printf("SimpleMtkWlan-mwx: " x)
+
+/* Interrupt-path breadcrumbs, see sc_intr_phase. */
+enum {
+	MWX_PHASE_IDLE,
+	MWX_PHASE_INTR,
+	MWX_PHASE_TX_DONE,
+	MWX_PHASE_RX_FWDL,
+	MWX_PHASE_RX_MCU,
+	MWX_PHASE_RX_DATA,
+	MWX_PHASE_MCU_EVENT,
+	MWX_PHASE_NET80211,
+	MWX_PHASE_IF_INPUT,
+};
+#define MWX_PHASE(sc, p) do {						\
+	(sc)->sc_intr_phase = (p);					\
+	(sc)->sc_intr_phase_ts = mach_absolute_time();			\
+} while (0)
 #define MWX_DEV_LOG(sc, fmt, args...) \
 	printf("SimpleMtkWlan-mwx: %s: " fmt, DEVNAME(sc), ##args)
 
@@ -463,6 +481,12 @@ struct mwx_softc {
 	uint32_t		sc_intr_kicks;		/* handler run by the watchdog */
 	uint32_t		sc_wd_ticks;
 	int			sc_intr_stall;
+	/*
+	 * Where the interrupt path is, for the watchdog to report when it
+	 * stalls (MWX_PHASE_*). Written on the work loop, read racily.
+	 */
+	volatile int		sc_intr_phase;
+	volatile uint64_t	sc_intr_phase_ts;	/* mach_absolute_time */
 
 	/* mcu */
 	uint32_t		sc_mcu_seq;
@@ -1776,6 +1800,7 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml)
 		rxi.rxi_rssi = mwx_dbm_to_rssi(rxi.rxi_rssi);
 
 	/* send the frame to the 802.11 layer */
+	MWX_PHASE(sc, MWX_PHASE_NET80211);
 	ieee80211_inputm(ifp, m, ni, &rxi, ml);
 
 	/* node is no longer needed */
@@ -1816,6 +1841,7 @@ mwx_intr(void *arg)
 
 again:
 	sc->sc_intr_count++;
+	MWX_PHASE(sc, MWX_PHASE_INTR);
 
 	/* TODO power management */
 //	mt76_connac_pm_ref(&dev->mphy, &dev->pm);
@@ -1847,15 +1873,24 @@ again:
 			intr |= MT_INT_RX_DONE_DATA;
 	}
 
-	if (intr & MT_INT_TX_DONE_ALL)
+	if (intr & MT_INT_TX_DONE_ALL) {
+		MWX_PHASE(sc, MWX_PHASE_TX_DONE);
 		mwx_dma_tx_done(sc);
+	}
 
-	if (intr & MT_INT_RX_DONE_WM)
+	if (intr & MT_INT_RX_DONE_WM) {
+		MWX_PHASE(sc, MWX_PHASE_RX_FWDL);
 		mwx_dma_rx_done(sc, &sc->sc_rxfwdlq);
-	if (intr & MT_INT_RX_DONE_WM2)
+	}
+	if (intr & MT_INT_RX_DONE_WM2) {
+		MWX_PHASE(sc, MWX_PHASE_RX_MCU);
 		mwx_dma_rx_done(sc, &sc->sc_rxmcuq);
-	if (intr & MT_INT_RX_DONE_DATA)
+	}
+	if (intr & MT_INT_RX_DONE_DATA) {
+		MWX_PHASE(sc, MWX_PHASE_RX_DATA);
 		mwx_dma_rx_done(sc, &sc->sc_rxq);
+	}
+	MWX_PHASE(sc, MWX_PHASE_IDLE);
 
 	/* TODO power management */
 //	mt76_connac_pm_unref(&dev->mphy, &dev->pm);
@@ -1933,13 +1968,25 @@ mwx_intr_watchdog(struct mwx_softc *sc)
 		return;
 	sc->sc_intr_stall = 0;
 	sc->sc_intr_kicks++;
-	if (kick_log_count < 32) {
-		kick_log_count++;
-		MWX_DEV_LOG(sc, "interrupt stalled sta=0x%08x ena=0x%08x "
-		    "intr=%u, running handler\n", sta, ena, sc->sc_intr_count);
+	{
+		int phase = sc->sc_intr_phase, ran;
+		uint64_t age_ns = 0;
+
+		absolutetime_to_nanoseconds(mach_absolute_time() -
+		    sc->sc_intr_phase_ts, &age_ns);
+		ran = gMwxHal != NULL &&
+		    gMwxHal->mwxTryRunGated(mwx_intr_kick, sc);
+		if (!ran)
+			sc->sc_intr_stall = 1;	/* gate busy: retry next tick */
+		if (kick_log_count < 32) {
+			kick_log_count++;
+			MWX_DEV_LOG(sc, "interrupt stalled sta=0x%08x ena=0x%08x "
+			    "intr=%u phase=%d for %llu ms, handler %s\n",
+			    sta, ena, sc->sc_intr_count, phase,
+			    (unsigned long long)(age_ns / 1000000),
+			    ran ? "run" : "not run (work loop gate busy)");
+		}
 	}
-	if (gMwxHal != NULL && !gMwxHal->mwxTryRunGated(mwx_intr_kick, sc))
-		sc->sc_intr_stall = 1;	/* gate busy: retry next tick */
 }
 
 /*
@@ -3200,6 +3247,7 @@ mwx_dma_rx_process(struct mwx_softc *sc, struct mbuf_list *ml)
 		switch (type) {
 		case PKT_TYPE_RX_EVENT:
 			event_count++;
+			MWX_PHASE(sc, MWX_PHASE_MCU_EVENT);
 			mwx_mcu_rx_event(sc, m);
 			break;
 		case PKT_TYPE_TXRX_NOTIFY:
@@ -3259,6 +3307,7 @@ mwx_dma_rx_process(struct mwx_softc *sc, struct mbuf_list *ml)
 		sc->sc_rx_process_events++;
 	}
 
+	MWX_PHASE(sc, MWX_PHASE_IF_INPUT);
 	if_input(&sc->sc_ic.ic_if, &mlout);
 }
 
@@ -6043,6 +6092,22 @@ mt7921_mac_tx_rate_val(struct mwx_softc *sc)
 	return (rate & MT_TX_RATE_IDX_MASK) | (mode & MT_TX_RATE_MODE_MASK);
 }
 
+/* Is this 802.11 data frame an EAPOL frame (LLC/SNAP, ethertype 0x888e)? */
+static int
+mwx_is_eapol(struct mbuf *m, u_int hdrlen)
+{
+	static const uint8_t eapol_llc[8] = {
+		0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8e
+	};
+	uint8_t llc[sizeof(eapol_llc)];
+
+	if (mbuf_pkthdr_len(m) < hdrlen + sizeof(llc))
+		return 0;
+	if (mbuf_copydata(m, hdrlen, sizeof(llc), llc) != 0)
+		return 0;
+	return memcmp(llc, eapol_llc, sizeof(llc)) == 0;
+}
+
 void
 mt7921_mac_write_txwi_80211(struct mwx_softc *sc, struct mbuf *m,
     struct ieee80211_node *ni, struct mt76_txwi *txp)
@@ -6050,19 +6115,26 @@ mt7921_mac_write_txwi_80211(struct mwx_softc *sc, struct mbuf *m,
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ieee80211_frame *wh;
 	uint32_t val;
-	uint8_t type, subtype, tid = 0;
+	uint8_t fc_type, type, subtype, tid = 0;
 	u_int hdrlen;
 	int multicast;
 
 
 	wh = mtod(m, struct ieee80211_frame *);
-	type = wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK;
-	type >>= IEEE80211_FC0_TYPE_SHIFT;
+	/*
+	 * fc_type keeps net80211's in-place encoding for comparisons with
+	 * IEEE80211_FC0_TYPE_*; type/subtype are shifted for the TXD fields.
+	 * Comparing the shifted value against IEEE80211_FC0_TYPE_DATA (0x08)
+	 * treated every data frame as management: fixed 6 Mbps OFDM and
+	 * BA_DISABLE on all TX, capping upload at ~4 Mbps.
+	 */
+	fc_type = wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK;
+	type = fc_type >> IEEE80211_FC0_TYPE_SHIFT;
 	subtype = wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK;
 	subtype >>= IEEE80211_FC0_SUBTYPE_SHIFT;
 	multicast = IEEE80211_IS_MULTICAST(wh->i_addr1);
 
-	if (type == IEEE80211_FC0_TYPE_CTL)
+	if (fc_type == IEEE80211_FC0_TYPE_CTL)
 		hdrlen = sizeof(struct ieee80211_frame_min);
 	else
 		hdrlen = ieee80211_get_hdrlen(wh);
@@ -6106,7 +6178,9 @@ mt7921_mac_write_txwi_80211(struct mwx_softc *sc, struct mbuf *m,
 	}
 #endif
 
-	if (multicast || type != IEEE80211_FC0_TYPE_DATA) {
+	/* Like mt76 with IEEE80211_TX_CTL_USE_MINRATE, keep EAPOL at the basic rate. */
+	if (multicast || fc_type != IEEE80211_FC0_TYPE_DATA ||
+	    mwx_is_eapol(m, hdrlen)) {
 		/* Fixed rata is available just for 802.11 txd */
 		uint32_t rate, val6;
 
