@@ -480,6 +480,7 @@ struct mwx_softc {
 	uint32_t		sc_intr_recheck;	/* events found after re-enable */
 	uint32_t		sc_intr_kicks;		/* handler run by the watchdog */
 	uint32_t		sc_wd_ticks;
+	uint32_t		sc_wd_last_intr;	/* sc_intr_count last tick */
 	int			sc_intr_stall;
 	/*
 	 * Where the interrupt path is, for the watchdog to report when it
@@ -1934,6 +1935,7 @@ mwx_intr_watchdog(struct mwx_softc *sc)
 {
 	static uint32_t health_log_count, mcu_err_log_count, kick_log_count;
 	uint32_t sta, ena, mcu, pending;
+	int progress;
 
 	sta = mwx_read(sc, MT_WFDMA0_HOST_INT_STA);
 	ena = mwx_read(sc, MT_WFDMA0_HOST_INT_ENA);
@@ -1960,7 +1962,13 @@ mwx_intr_watchdog(struct mwx_softc *sc)
 		    mcu, sta);
 	}
 
-	if (pending == 0) {
+	/*
+	 * Under load INT_STA is often non-zero when sampled while the handler
+	 * is running; only a lack of progress since the last tick is a stall.
+	 */
+	progress = sc->sc_intr_count != sc->sc_wd_last_intr;
+	sc->sc_wd_last_intr = sc->sc_intr_count;
+	if (pending == 0 || progress) {
 		sc->sc_intr_stall = 0;
 		return;
 	}
@@ -7559,10 +7567,14 @@ int mt7921_mcu_set_associated_peer(struct mwx_softc *sc)
     int seq, rv = mwx_mcu_send_mbuf(sc, MCU_UNI_CMD_STA_REC_UPDATE, m, &seq);
     uint32_t status = 0;
     if (!rv) rv = mwx_mcu_wait_resp_int(sc, MCU_UNI_CMD_STA_REC_UPDATE, seq, &status);
-    MWX_DEV_LOG(sc, "assoc_peer aid=%u state=2 ht=%d vht=%d he=%d chw=%d phy=0x%x transport=%d firmware=%u\n",
+    /* ap_he: the AP advertised HE capabilities (beacon/probe response). */
+    MWX_DEV_LOG(sc, "assoc_peer aid=%u state=2 ht=%d vht=%d he=%d ap_he=%d chw=%d phy=0x%x transport=%d firmware=%u\n",
         IEEE80211_AID(ni->ni_associd), (ni->ni_flags & IEEE80211_NODE_HT) != 0,
         (ni->ni_flags & IEEE80211_NODE_VHT) != 0,
-        (ni->ni_flags & IEEE80211_NODE_HE) != 0, ni->ni_chw,
+        (ni->ni_flags & IEEE80211_NODE_HE) != 0,
+        ni->ni_he_cap_elem.mac_cap_info[0] != 0 ||
+        ni->ni_he_cap_elem.phy_cap_info[0] != 0 ||
+        ni->ni_he_cap_elem.phy_cap_info[1] != 0, ni->ni_chw,
         mt7921_get_phy_mode_v2(sc, ni), rv, status);
     return rv ? rv : (status ? EIO : 0);
 }
