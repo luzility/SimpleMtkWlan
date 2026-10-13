@@ -201,6 +201,7 @@ int bus_dmamap_create(bus_dma_tag_t tag, bus_size_t size, int nsegments, bus_siz
 	*dmamp = new bus_dmamap;
 	memset(*dmamp, 0, sizeof(**dmamp));
 	(*dmamp)->dm_maxsize = size;
+	(*dmamp)->dm_maxsegs = nsegments;
 	(*dmamp)->cursor = IOMbufNaturalMemoryCursor::withSpecification(maxsegsz, nsegments);
 	if ((*dmamp)->cursor == 0)
 		return 1;
@@ -369,7 +370,18 @@ int bus_dmamap_load(bus_dmamap_t map, mbuf_t mb) {
 	}
 	map->dm_mbuf = mb;
 	map->dm_bounce = false;
-	map->dm_nsegs = map->cursor->getPhysicalSegmentsWithCoalesce(mb, segs, 23);
+	/*
+	 * Honour the map's segment limit. Passing a larger count overrides the
+	 * cursor's own limit, so a long mbuf chain was never coalesced and a
+	 * caller expecting OpenBSD's EFBIG got more segments than its
+	 * descriptor holds (a 5-segment frame overflowed the 4-buffer MT792x
+	 * TXP and the firmware stopped DMA). With the limit, the cursor
+	 * coalesces the chain instead.
+	 */
+	UInt32 maxsegs = 23;
+	if (map->dm_maxsegs > 0 && map->dm_maxsegs < 23)
+		maxsegs = (UInt32)map->dm_maxsegs;
+	map->dm_nsegs = map->cursor->getPhysicalSegmentsWithCoalesce(mb, segs, maxsegs);
 	if (map->dm_nsegs == 0)
 		return 1;
 	size_t pktlen = mbuf_pkthdr_len(mb);

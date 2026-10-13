@@ -2363,6 +2363,21 @@ mwx_txwi_enqueue(struct mwx_softc *sc, struct mwx_txwi *mt, struct mbuf *m)
 
 	nsegs = mt->mt_map->dm_nsegs;
 
+	/*
+	 * The TXP holds MT_HW_TXP_MAX_BUF_NUM buffers. More would be written
+	 * past it into the next TXWI, and the frame would end without
+	 * MT_TXD_LEN_LAST, which makes the firmware stop DMA.
+	 */
+	if (nsegs > MT_HW_TXP_MAX_BUF_NUM) {
+		static uint32_t txp_overflow_log_count;
+
+		if (txp_overflow_log_count++ < 16)
+			MWX_DEV_LOG(sc, "tx dropped: %d segments, TXP holds %d\n",
+			    nsegs, MT_HW_TXP_MAX_BUF_NUM);
+		bus_dmamap_unload(sc->sc_dmat, mt->mt_map);
+		return EFBIG;
+	}
+
 	bus_dmamap_sync(sc->sc_dmat, mt->mt_map, 0, mt->mt_map->dm_mapsize,
 	    BUS_DMASYNC_PREWRITE);
 
