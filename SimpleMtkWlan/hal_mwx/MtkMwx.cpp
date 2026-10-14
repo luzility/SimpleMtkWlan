@@ -1316,8 +1316,25 @@ mwx_newstate_task(void *ptr)
 
 	switch (ostate) {
 	case IEEE80211_S_RUN:
-		if (nstate != ostate)
-			mwx_mcu_set_deep_sleep(sc, 1);
+		if (nstate == ostate)
+			break;
+		/*
+		 * Leaving the BSS (switching APs or bands, or disconnecting):
+		 * mark the firmware BSS disconnected first, as mt76 does with
+		 * uni_add_bss(enable=false). Otherwise it keeps acting for a
+		 * connected BSS (null/power-save frames) towards wcid 1, which
+		 * AUTH re-points at the next AP, and that AP answers the
+		 * unauthenticated data with a storm of "Deauth reason 6".
+		 * net80211 stays in RUN on RUN->AUTH with an AUTH frame.
+		 */
+		if (!(nstate == IEEE80211_S_AUTH &&
+		    arg == IEEE80211_FC0_SUBTYPE_AUTH)) {
+			rv = mt7921_mcu_set_associated_bss(sc, 0);
+			MWX_DEV_LOG(sc, "left BSS, firmware BSS disconnected rv=%d\n",
+			    rv);
+			rv = 0;
+		}
+		mwx_mcu_set_deep_sleep(sc, 1);
 		break;
 	case IEEE80211_S_SCAN:
 		if (nstate == ostate) {
